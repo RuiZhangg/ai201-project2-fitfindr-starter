@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -42,6 +44,85 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+    }
+
+
+# ── parsing helpers ───────────────────────────────────────────────────────────
+
+_PRICE_PATTERNS = [
+    r"(?:under|below|less than)\s*\$?\s*(\d+(?:\.\d+)?)",
+    r"max(?:imum)?\s*\$?\s*(\d+(?:\.\d+)?)",
+]
+
+_SIZE_PATTERNS = [
+    r"\bsize\s+([a-z0-9/]+(?:\s*[a-z0-9/]+)?)",
+    r"\bin\s+size\s+([a-z0-9/]+(?:\s*[a-z0-9/]+)?)",
+]
+
+
+def _extract_price(query: str) -> float | None:
+    """Return a price ceiling if the user included one."""
+    for pattern in _PRICE_PATTERNS:
+        match = re.search(pattern, query, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _extract_size(query: str) -> str | None:
+    """Return a size string if the user included one."""
+    lowered = query.lower()
+    for pattern in _SIZE_PATTERNS:
+        match = re.search(pattern, lowered, flags=re.IGNORECASE)
+        if match:
+            size_text = match.group(1)
+            size_text = re.split(
+                r"\b(?:under|below|less|max(?:imum)?|for|with|and)\b",
+                size_text,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            return size_text.strip(" ,.-").upper() or None
+    return None
+
+
+def _clean_description(query: str) -> str:
+    """Remove routing phrases so search_listings gets the item request."""
+    first_sentence = re.split(r"[.!?]", query, maxsplit=1)[0].strip()
+
+    cleaned = re.sub(
+        r"^\s*(i'm looking for|i am looking for|looking for|find me|show me|need|want)\s+",
+        "",
+        first_sentence,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^\s*(?:a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(?:in\s+)?size\s+[a-z0-9/]+(?:\s*[a-z0-9/]+)?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:under|below|less than|max(?:imum)?)\s*\$?\s*\d+(?:\.\d+)?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\$\s*\d+(?:\.\d+)?", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    return cleaned
+
+
+def _parse_query(query: str) -> dict:
+    """Extract the search parameters used by the first tool."""
+    description = _clean_description(query)
+    size = _extract_size(query)
+    max_price = _extract_price(query)
+    return {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
     }
 
 
@@ -92,9 +173,68 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    session["parsed"] = _parse_query(query)
+    description = session["parsed"].get("description")
+    size = session["parsed"].get("size")
+    max_price = session["parsed"].get("max_price")
+
+    if not description:
+        session["error"] = (
+            "I couldn't tell what item you want yet. Try describing the piece "
+            "you're looking for, like 'vintage graphic tee under $30'."
+        )
+        return session
+
+    session["search_results"] = search_listings(description, size, max_price)
+    if not session["search_results"]:
+        filter_bits = []
+        if size:
+            filter_bits.append(f"size {size}")
+        if max_price is not None:
+            filter_bits.append(f"under ${max_price:.0f}")
+
+        filter_text = f" with {' and '.join(filter_bits)}" if filter_bits else ""
+        session["error"] = (
+            f"I couldn't find any listings for {description}{filter_text}. "
+            "Try broader keywords, a higher budget, or removing the size filter."
+        )
+        return session
+
+    session["selected_item"] = session["search_results"][0]
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"],
+        session["wardrobe"],
+    )
+
+    if not session["outfit_suggestion"] or not session["outfit_suggestion"].strip():
+        session["error"] = "I found a listing, but I couldn't build an outfit idea right now."
+        session["outfit_suggestion"] = None
+        return session
+
+    if "couldn't build an outfit idea" in session["outfit_suggestion"].lower():
+        session["error"] = session["outfit_suggestion"]
+        session["outfit_suggestion"] = None
+        return session
+
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"],
+        session["selected_item"],
+    )
+
+    if not session["fit_card"] or not session["fit_card"].strip():
+        session["error"] = (
+            "I found an item, but I couldn't generate the final fit card right now."
+        )
+        session["fit_card"] = None
+        return session
+
+    fit_card_lower = session["fit_card"].lower()
+    if "couldn't generate" in fit_card_lower or "empty or incomplete" in fit_card_lower:
+        session["error"] = session["fit_card"]
+        session["fit_card"] = None
+
     return session
 
 

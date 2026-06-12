@@ -43,18 +43,50 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    if not user_query or not user_query.strip():
+        return "Please enter a description of the item you're looking for.", "", ""
+
+    if wardrobe_choice == "Empty wardrobe (new user)":
+        wardrobe = get_empty_wardrobe()
+    else:
+        wardrobe = get_example_wardrobe()
+
+    session = run_agent(user_query.strip(), wardrobe)
+    if session["error"]:
+        return session["error"], "", ""
+
+    item = session["selected_item"]
+    style_tags = ", ".join(item.get("style_tags", []))
+    colors = ", ".join(item.get("colors", []))
+    brand = item.get("brand") or "Unknown brand"
+    listing_text = (
+        f"{item['title']}\n"
+        f"Price: ${item['price']:.2f}\n"
+        f"Size: {item['size']}\n"
+        f"Condition: {item['condition']}\n"
+        f"Platform: {item['platform']}\n"
+        f"Brand: {brand}\n"
+        f"Colors: {colors}\n"
+        f"Style tags: {style_tags}\n"
+        f"Description: {item['description']}"
+    )
+    return listing_text, session["outfit_suggestion"], session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
 
+# Milestone 5 failure-mode coverage:
+# - No-results path: impossible search with tight filters.
+# - Empty-wardrobe path: same valid search, but with the new-user wardrobe option.
+# - create_fit_card empty-outfit guard is still a direct tool test; reuse the
+#   first query to fetch a valid listing before calling create_fit_card("", item).
 EXAMPLE_QUERIES = [
-    "vintage graphic tee under $30",
-    "90s track jacket in size M",
-    "flowy midi skirt under $40",
-    "black combat boots size 8",
-    "designer ballgown size XXS under $5",   # deliberate no-results test
+    ["vintage graphic tee under $30", "Example wardrobe"],
+    ["vintage graphic tee under $30", "Empty wardrobe (new user)"],
+    ["designer ballgown size XXS under $5", "Example wardrobe"],
+    ["90s track jacket in size M", "Example wardrobe"],
+    ["flowy midi skirt under $40", "Example wardrobe"],
+    ["black combat boots size 8", "Example wardrobe"],
 ]
 
 def build_interface():
@@ -99,7 +131,7 @@ Describe what you're looking for — include size and price if you want to filte
             )
 
         gr.Examples(
-            examples=[[q, "Example wardrobe"] for q in EXAMPLE_QUERIES],
+            examples=EXAMPLE_QUERIES,
             inputs=[query_input, wardrobe_choice],
             label="Try these queries",
         )
