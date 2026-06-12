@@ -12,26 +12,21 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
-import os
-
-from dotenv import load_dotenv
 from groq import Groq
 
+from config import GROQ_API_KEY, LLM_MODEL
 from utils.data_loader import load_listings
-
-load_dotenv()
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 
 def _get_groq_client():
     """Initialize and return a Groq client using GROQ_API_KEY from .env."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
+    if not GROQ_API_KEY:
         raise ValueError(
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
-    return Groq(api_key=api_key)
+    return Groq(api_key=GROQ_API_KEY)
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
