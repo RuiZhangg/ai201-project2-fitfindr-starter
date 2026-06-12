@@ -12,10 +12,29 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
+import re
+
 from groq import Groq
 
 from config import GROQ_API_KEY, LLM_MODEL
 from utils.data_loader import load_listings
+
+
+STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "i",
+    "im",
+    "in",
+    "looking",
+    "of",
+    "the",
+    "to",
+    "under",
+    "with",
+}
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -27,6 +46,131 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=GROQ_API_KEY)
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _tokenize(text: str) -> list[str]:
+    """Normalize freeform text into lowercase keyword tokens."""
+    return [
+        token for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if token not in STOP_WORDS
+    ]
+
+
+def _normalize_size(size: str | None) -> list[str]:
+    """Split a size string into comparable tokens like 'm', 'w30', '8'."""
+    return re.findall(r"[a-z0-9]+", (size or "").lower())
+
+
+def _size_matches(listing_size: str, requested_size: str | None) -> bool:
+    """Allow flexible matching such as M -> S/M and W30 -> W30 L30."""
+    if not requested_size:
+        return True
+
+    requested_tokens = set(_normalize_size(requested_size))
+    listing_tokens = set(_normalize_size(listing_size))
+
+    if not requested_tokens:
+        return True
+
+    normalized_listing = " ".join(_normalize_size(listing_size))
+    normalized_requested = " ".join(_normalize_size(requested_size))
+
+    return (
+        requested_tokens.issubset(listing_tokens)
+        or normalized_requested in normalized_listing
+        or normalized_listing in normalized_requested
+    )
+
+
+def _score_listing(listing: dict, keywords: list[str], phrase: str) -> int:
+    """Score a listing based on keyword overlap in important fields."""
+    title_tokens = set(_tokenize(listing.get("title", "")))
+    description_tokens = set(_tokenize(listing.get("description", "")))
+    category_tokens = set(_tokenize(listing.get("category", "")))
+    style_tokens = set(_tokenize(" ".join(listing.get("style_tags", []))))
+    color_tokens = set(_tokenize(" ".join(listing.get("colors", []))))
+    brand_tokens = set(_tokenize(listing.get("brand") or ""))
+    listing_blob = " ".join(
+        [
+            listing.get("title", ""),
+            listing.get("description", ""),
+            listing.get("category", ""),
+            " ".join(listing.get("style_tags", [])),
+            " ".join(listing.get("colors", [])),
+            listing.get("brand") or "",
+        ]
+    ).lower()
+
+    score = 0
+    if phrase and phrase in listing_blob:
+        score += 5
+
+    for keyword in keywords:
+        if keyword in title_tokens:
+            score += 4
+        if keyword in style_tokens:
+            score += 3
+        if keyword in description_tokens:
+            score += 2
+        if keyword in category_tokens:
+            score += 2
+        if keyword in color_tokens:
+            score += 1
+        if keyword in brand_tokens:
+            score += 1
+
+    return score
+
+
+def _format_listing(listing: dict) -> str:
+    """Build a compact description of a listing for LLM prompts."""
+    brand = listing.get("brand") or "Unknown brand"
+    style_tags = ", ".join(listing.get("style_tags", []))
+    colors = ", ".join(listing.get("colors", []))
+    return (
+        f"Title: {listing.get('title', 'Unknown item')}\n"
+        f"Category: {listing.get('category', 'unknown')}\n"
+        f"Description: {listing.get('description', '')}\n"
+        f"Size: {listing.get('size', 'unknown')}\n"
+        f"Condition: {listing.get('condition', 'unknown')}\n"
+        f"Price: ${listing.get('price', 'unknown')}\n"
+        f"Colors: {colors}\n"
+        f"Style tags: {style_tags}\n"
+        f"Brand: {brand}\n"
+        f"Platform: {listing.get('platform', 'unknown')}"
+    )
+
+
+def _format_wardrobe_items(wardrobe_items: list[dict]) -> str:
+    """Format wardrobe pieces into readable prompt lines."""
+    lines = []
+    for item in wardrobe_items:
+        colors = ", ".join(item.get("colors", []))
+        tags = ", ".join(item.get("style_tags", []))
+        notes = item.get("notes") or "No extra notes."
+        lines.append(
+            f"- {item.get('name', 'Unnamed item')} "
+            f"(category: {item.get('category', 'unknown')}; "
+            f"colors: {colors}; style tags: {tags}; notes: {notes})"
+        )
+    return "\n".join(lines)
+
+
+def _call_llm(system_prompt: str, user_prompt: str, temperature: float) -> str:
+    """Send a chat completion request to Groq and return plain text."""
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+        max_tokens=300,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -64,8 +208,31 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    keywords = _tokenize(description)
+    if not keywords:
+        return []
+
+    phrase = " ".join(keywords)
+    matches: list[tuple[int, dict]] = []
+
+    for listing in load_listings():
+        if max_price is not None and listing.get("price", 0.0) > max_price:
+            continue
+        if size and not _size_matches(listing.get("size", ""), size):
+            continue
+
+        score = _score_listing(listing, keywords, phrase)
+        if score > 0:
+            matches.append((score, listing))
+
+    matches.sort(
+        key=lambda item: (
+            -item[0],
+            item[1].get("price", float("inf")),
+            item[1].get("title", ""),
+        )
+    )
+    return [listing for _, listing in matches]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -95,8 +262,48 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not new_item:
+        return "I couldn't suggest an outfit because no listing was provided."
+
+    wardrobe_items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+    item_summary = _format_listing(new_item)
+
+    if not wardrobe_items:
+        system_prompt = (
+            "You are a helpful fashion stylist. Give practical styling advice "
+            "for one thrifted item when the user has not shared wardrobe items."
+        )
+        user_prompt = (
+            "A user found this thrifted item:\n"
+            f"{item_summary}\n\n"
+            "The wardrobe is empty, so give general styling advice instead of "
+            "referencing closet pieces. Suggest 1-2 wearable outfit ideas, name "
+            "what kinds of bottoms, shoes, and layers would pair well, and keep "
+            "the tone casual and specific."
+        )
+    else:
+        system_prompt = (
+            "You are a helpful fashion stylist. Build outfit ideas using the "
+            "new thrifted item and specific named pieces from the user's wardrobe."
+        )
+        user_prompt = (
+            "The user is considering this thrifted item:\n"
+            f"{item_summary}\n\n"
+            "Here are the wardrobe pieces you can use:\n"
+            f"{_format_wardrobe_items(wardrobe_items)}\n\n"
+            "Suggest 1-2 complete outfits that explicitly mention named wardrobe "
+            "pieces from the list. Explain the vibe and any small styling move "
+            "that makes the outfit feel intentional."
+        )
+
+    try:
+        response = _call_llm(system_prompt, user_prompt, temperature=0.7)
+    except Exception:
+        return "I found a listing, but I couldn't build an outfit idea right now."
+
+    if not response.strip():
+        return "I found a listing, but I couldn't build an outfit idea right now."
+    return response
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -128,5 +335,42 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return (
+            "I couldn't generate a fit card because the outfit description was "
+            "empty or incomplete."
+        )
+
+    if not new_item:
+        return "I couldn't generate a fit card because the listing details were missing."
+
+    system_prompt = (
+        "You write short, natural outfit captions for social posts. Keep them "
+        "specific, casual, and human."
+    )
+    user_prompt = (
+        "Write a 2-4 sentence caption for a thrifted outfit post.\n\n"
+        f"Listing details:\n{_format_listing(new_item)}\n\n"
+        f"Outfit idea:\n{outfit}\n\n"
+        "Requirements:\n"
+        "- Mention the item title naturally once.\n"
+        "- Mention the price once.\n"
+        "- Mention the resale platform once.\n"
+        "- Capture the outfit vibe in specific terms.\n"
+        "- Sound like a real OOTD caption, not a product listing."
+    )
+
+    try:
+        response = _call_llm(system_prompt, user_prompt, temperature=1.0)
+    except Exception:
+        return (
+            "I couldn't generate the final fit card right now. Please try again "
+            "after the outfit step succeeds."
+        )
+
+    if not response.strip():
+        return (
+            "I couldn't generate the final fit card right now. Please try again "
+            "after the outfit step succeeds."
+        )
+    return response
